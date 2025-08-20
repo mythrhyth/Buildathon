@@ -1,0 +1,21 @@
+# Core LangChain and Hugging Face libraries
+langchain
+langchain-community
+langchain-huggingface
+python-dotenv
+langchainhub # For pulling agent prompts
+
+# Agent and Tools
+langchain-agents
+tavily-python # For the web search tool
+
+# For the LLM backend
+torch
+
+# For text-to-speech and language detection
+gTTS
+langdetect
+
+# For microphone input and speech-to-text
+SpeechRecognition
+PyAudio # A dependency for SpeechRecognition to access the microphone
