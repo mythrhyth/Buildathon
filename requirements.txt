@@ -3,10 +3,8 @@ langchain
 langchain-community
 langchain-huggingface
 python-dotenv
-langchainhub # For pulling agent prompts
 
 # Agent and Tools
-langchain-agents
 tavily-python # For the web search tool
 
 # For the LLM backend
@@ -19,3 +17,6 @@ langdetect
 # For microphone input and speech-to-text
 SpeechRecognition
 PyAudio # A dependency for SpeechRecognition to access the microphone
+
+# Pinned for Python 3.9 compatibility
+aiohttp<3.9.0
