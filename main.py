@@ -1,7 +1,7 @@
 import logging
 import os
 import textwrap
-from typing import List, Optional
+from typing import Optional, Tuple
 
 import dagshub
 import mlflow
@@ -14,31 +14,16 @@ from langchain.schema.runnable import Runnable, RunnablePassthrough
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langdetect import detect, LangDetectException
+import platform
+from mlflow.utils.git_utils import get_git_commit, get_git_branch
 
-# --- 1. CONFIGURATION & INITIALIZATION ---
-
-# Configure logging to provide informative output
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load environment variables from .env file
 load_dotenv()
 
-# --- Constants ---
 LLM_REPO_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
 
-# --- 2. WEB SEARCH RAG PIPELINE SETUP ---
-
 def setup_web_rag_chain(llm: ChatHuggingFace, search_tool: TavilySearchResults) -> Runnable:
-    """
-    Sets up a LangChain RAG chain that uses web search as its retriever.
-
-    Args:
-        llm: The language model component of the chain.
-        search_tool: The Tavily search tool.
-
-    Returns:
-        A runnable LangChain RAG chain.
-    """
     template = """
     You are a helpful assistant. Answer the user's question based on the following web search results.
     Provide a concise, synthesized answer in the same language as the question.
@@ -53,117 +38,108 @@ def setup_web_rag_chain(llm: ChatHuggingFace, search_tool: TavilySearchResults) 
     """
     prompt = PromptTemplate.from_template(template)
 
-    # This chain will first run the search tool, then pass the results and the original
-    # question to the prompt and the LLM.
     return (
         {"context": search_tool, "question": RunnablePassthrough()}
         | prompt
         | llm
     )
 
-# --- 3. CORE APPLICATION LOGIC ---
+def log_environment():
+    mlflow.log_param("python_version", platform.python_version())
+    mlflow.log_param("torch_version", torch.__version__)
+    mlflow.log_param("cuda_available", torch.cuda.is_available())
+    mlflow.log_param("system", platform.system())
+    mlflow.log_param("machine", platform.machine())
 
-def get_audio_input() -> Optional[str]:
-    """
-    Captures audio from the microphone and converts it to text.
+    try:
+        mlflow.log_param("git_commit", get_git_commit("."))
+        mlflow.log_param("git_branch", get_git_branch("."))
+    except Exception as e:
+        mlflow.log_param("git_info_error", str(e))
 
-    Returns:
-        The recognized text as a string, or None if an error occurs.
-    """
+    if os.path.exists("requirements.txt"):
+        mlflow.log_artifact("requirements.txt")
+
+def get_audio_input() -> Optional[Tuple[str, str]]:
     recognizer = sr.Recognizer()
-    # Increase the pause_threshold to wait 2 seconds after speech ends
-    # before considering the phrase complete. The default is 0.8.
     recognizer.pause_threshold = 2.0
+    audio_file_path = "user_audio.wav"
 
     with sr.Microphone() as source:
         logging.info("Adjusting for ambient noise... Please wait.")
         recognizer.adjust_for_ambient_noise(source, duration=1)
         logging.info("Listening... Please ask your question.")
         try:
-            audio = recognizer.listen(source, timeout=5, phrase_time_limit=15) # Increased time limit
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=15)
+            with open(audio_file_path, "wb") as f:
+                f.write(audio.get_wav_data())
+
             logging.info("Recognizing speech...")
-            # Use Google's free web speech API
-            query = recognizer.recognize_google(audio, language='hi-IN') # Prioritize Hindi
+            query = recognizer.recognize_google(audio)
             logging.info(f"User said: {query}")
-            return query
-        except sr.WaitTimeoutError:
-            logging.error("Listening timed out while waiting for phrase to start.")
-        except sr.UnknownValueError:
-            logging.error("Google Speech Recognition could not understand audio.")
-        except sr.RequestError as e:
-            logging.error(f"Could not request results from Google Speech Recognition service; {e}")
+            return query, audio_file_path
+        except Exception as e:
+            logging.error(f"Audio input failed: {e}")
     return None
 
-
-def ask_and_speak(query: str, rag_chain: Runnable) -> None:
-    """
-    Takes a user query, gets an answer from the RAG chain,
-    and synthesizes it to speech using gTTS.
-
-    Args:
-        query: The user's question.
-        rag_chain: The RAG chain to use for generating the answer.
-    """
-    # Start an MLflow run to log this interaction
+def ask_and_speak(query: str, audio_path: str, rag_chain: Runnable) -> None:
     with mlflow.start_run():
+        log_environment()
+        
         logging.info(f"Received query: '{query}'")
         mlflow.log_param("user_query", query)
+        mlflow.log_param("llm_repo_id", LLM_REPO_ID)
+        mlflow.log_artifact(audio_path, "input_audio")
+        mlflow.log_artifact(__file__, "code")
 
         try:
             detected_lang = detect(query)
-            logging.info(f"Detected language: {detected_lang}")
             mlflow.log_param("detected_language", detected_lang)
         except LangDetectException as e:
-            logging.warning(f"Could not detect language. Defaulting to English. Error: {e}")
             detected_lang = 'en'
-            mlflow.log_param("detected_language", "en (defaulted)")
+            mlflow.log_param("detected_language", "default_en")
+            logging.warning(f"Language detection failed: {e}")
 
-        logging.info("Searching the web and generating answer...")
-        ai_message_response = rag_chain.invoke(query)
-        text_answer = ai_message_response.content
-        
-        if not text_answer:
-            logging.warning("LLM returned an empty answer.")
-            mlflow.log_param("status", "failed_empty_response")
+        logging.info("Running RAG chain...")
+        try:
+            ai_message_response = rag_chain.invoke(query)
+            text_answer = ai_message_response.content
+            with open("final_output.txt", "w", encoding="utf-8") as f:
+                f.write(text_answer)
+            mlflow.log_artifact("final_output.txt", "final_output_text")
+        except Exception as e:
+            mlflow.log_param("rag_error", str(e))
+            logging.error(f"RAG failed: {e}")
             return
 
-        # Wrap the text for cleaner printing in the terminal
+        if not text_answer:
+            mlflow.log_param("status", "failed_empty_response")
+            return
+        
         wrapped_text = textwrap.fill(text_answer, width=100)
         logging.info(f"Generated Text Answer:\n{wrapped_text}")
-        # Log the full answer as a text artifact in MLflow
-        mlflow.log_text(text_answer, "llm_response.txt")
 
-        logging.info(f"Synthesizing speech in '{detected_lang}' with gTTS...")
+        logging.info("Synthesizing with gTTS...")
         try:
             tts_obj = gTTS(text=text_answer, lang=detected_lang)
-            audio_file_path = "answer.mp3"
-            tts_obj.save(audio_file_path)
-            logging.info(f"SUCCESS! Audio answer saved to {audio_file_path}")
-            # Log the generated audio file as an artifact
-            mlflow.log_artifact(audio_file_path)
+            output_audio_path = "answer.mp3"
+            tts_obj.save(output_audio_path)
+            mlflow.log_artifact(output_audio_path, "final_output_audio")
             mlflow.log_param("status", "success")
-            
+            logging.info(f"SUCCESS! Audio answer saved to {output_audio_path}")
         except Exception as e:
-            logging.error(f"An error occurred during speech synthesis: {e}")
-            mlflow.log_param("status", "failed_tts")
-
-# --- 4. MAIN EXECUTION BLOCK ---
+            mlflow.log_param("tts_error", str(e))
+            logging.error(f"TTS failed: {e}")
 
 def main() -> None:
-    """
-    Main function to set up and run the web-searching RAG application.
-    """
-    # Check for API keys
     api_keys = ["HUGGINGFACEHUB_API_TOKEN", "TAVILY_API_KEY", "MLFLOW_TRACKING_URI"]
     if not all(os.getenv(key) for key in api_keys):
         logging.error("One or more required API keys/URIs are not set in the .env file.")
         return
 
-    # Initialize DagsHub and MLflow
-    dagshub.init(repo_owner='YourUsername', repo_name='YourRepoName', mlflow=True)
+    dagshub.init(repo_owner='satyajeetrai007', repo_name='Buildathon', mlflow=True)
     mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI"))
 
-    # Initialize the LLM
     llm_endpoint = HuggingFaceEndpoint(
         repo_id=LLM_REPO_ID,
         task="text-generation",
@@ -172,19 +148,16 @@ def main() -> None:
     )
     chat_model = ChatHuggingFace(llm=llm_endpoint)
 
-    # Setup the web search tool
     search_tool = TavilySearchResults(max_results=3)
 
-    # Setup the RAG chain
     rag_chain = setup_web_rag_chain(chat_model, search_tool)
     logging.info("Web-searching RAG chain is ready for questions.")
 
-    # Get user input from the microphone
-    user_query = get_audio_input()
+    audio_input = get_audio_input()
 
-    # If we got a query, process it
-    if user_query:
-        ask_and_speak(user_query, rag_chain)
+    if audio_input:
+        user_query, audio_path = audio_input
+        ask_and_speak(user_query, audio_path, rag_chain)
     else:
         logging.error("Could not get a valid query from the microphone. Exiting.")
 
