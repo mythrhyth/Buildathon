@@ -1,2 +1,6 @@
 venv
 .env
+answer.mp3
+user_audio.wav
+final_output.txt
+notebooks
