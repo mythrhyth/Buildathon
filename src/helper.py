@@ -9,10 +9,11 @@ import torch
 from dotenv import load_dotenv
 from gtts import gTTS
 from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import Runnable, RunnablePassthrough
+from langchain.schema.runnable import Runnable, RunnablePassthrough, RunnableParallel
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 from langdetect import detect, LangDetectException
+
 import platform
 from mlflow.utils.git_utils import get_git_commit, get_git_branch
 
@@ -74,29 +75,44 @@ def ask_and_speak(query: str, audio_path: str, rag_chain: Runnable) -> None:
 
 
 
-
-def setup_web_rag_chain(llm: ChatHuggingFace, search_tool: TavilySearchResults) -> Runnable:
+def setup_hybrid_rag_chain(llm, search_tool, vectorstore_retriever) -> Runnable:
+    """
+    Hybrid RAG chain:
+    - Uses embeddings (query → vector similarity search in FAISS)
+    - Uses raw query for web search
+    """
     template = """
-    You are a helpful assistant. Answer the user's question based on the following web search results.
-    Provide a concise, synthesized answer in the same language as the question.
+    You are a helpful assistant. Answer the user's question based on the following sources:
+    
+    - Context from stored knowledge (books, PDFs, reports, etc.)
+    - Context from trusted web search results
+    
+    Provide a clear, concise, synthesized answer in the same language as the question.  
+    If you do not know the answer, just say: "I don’t know".
 
-    If you donot know the answer of question, just say i donot know
+    Context from stored database:
+    {db_context}
 
     Context from web search:
-    {context}
+    {web_context}
 
     Question:
     {question}
 
     Answer:
     """
+
     prompt = PromptTemplate.from_template(template)
 
-    return (
-        {"context": search_tool, "question": RunnablePassthrough()}
-        | prompt
-        | llm
+    # Combine both retrievers
+    combined_context = RunnableParallel(
+        db_context=vectorstore_retriever,   # embedding search
+        web_context=search_tool,            # raw query web search
+        question=RunnablePassthrough()
     )
+
+    return combined_context | prompt | llm
+
 
 def log_environment():
     mlflow.log_param("python_version", platform.python_version())

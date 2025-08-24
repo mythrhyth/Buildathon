@@ -1,28 +1,20 @@
 import logging
 import os
-import textwrap
 from typing import Optional, Tuple
 import dagshub
 import mlflow
-import speech_recognition as sr
-import torch
 from dotenv import load_dotenv
-from gtts import gTTS
-from langchain.prompts import PromptTemplate
-from langchain.schema.runnable import Runnable, RunnablePassthrough
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
-from langdetect import detect, LangDetectException
-import platform
-from mlflow.utils.git_utils import get_git_commit, get_git_branch
-from src.helper import ask_and_speak, setup_web_rag_chain, log_environment, get_audio_input
+from src.helper import ask_and_speak, setup_hybrid_rag_chain, get_audio_input
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 load_dotenv()
 
 LLM_REPO_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
-
 
 
 def main() -> None:
@@ -42,10 +34,20 @@ def main() -> None:
     )
     chat_model = ChatHuggingFace(llm=llm_endpoint)
 
-    search_tool = TavilySearchResults(max_results=3)
 
-    rag_chain = setup_web_rag_chain(chat_model, search_tool)
-    logging.info("Web-searching RAG chain is ready for questions.")
+    search_tool = TavilySearchResults(max_results=3)
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+    vectorstore = FAISS.load_local(
+        "agri_faiss_index",  
+        embeddings,
+        allow_dangerous_deserialization=True
+    )
+
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 5})
+
+    rag_chain = setup_hybrid_rag_chain(chat_model, search_tool, vectorstore_retriever=retriever)
+    logging.info("Hybrid RAG chain (DB + Web) is ready for farmer queries.")
 
     audio_input = get_audio_input()
 
@@ -54,6 +56,7 @@ def main() -> None:
         ask_and_speak(user_query, audio_path, rag_chain)
     else:
         logging.error("Could not get a valid query from the microphone. Exiting.")
+
 
 if __name__ == "__main__":
     main()
